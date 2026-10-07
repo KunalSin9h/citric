@@ -146,9 +146,7 @@ src/threads.h       threads on physical cores, spin barrier (270 ns)
 ## Limits
 
 - Context is 1,024 tokens.
-- One process serves one prompt at a time. There is no HTTP server yet.
 - x86 with AVX-512 only. There is no ARM version.
-- The ternary model is a little less accurate than the original. Do not use it where errors are dangerous.
 
 ## License
 
