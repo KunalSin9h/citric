@@ -13,7 +13,9 @@
 #define QKV (QDIM + 2 * KVDIM)
 #define NLAYER 26
 #define VOCAB 262144
-#define MAXCTX 1024
+#ifndef MAXCTX
+#define MAXCTX 32768         // Gemma 3 1B's trained context. KV pages are committed only as a sequence grows.
+#endif
 #define WINDOW 512
 #define EPS 1e-6f
 #ifndef MAXB
@@ -512,7 +514,7 @@ int main(int argc, char **argv) {
     if (getenv("SEED")) srng = strtoull(getenv("SEED"), NULL, 10) * 2654435761ull + 1;
     init(argv[1], B);
     if (argc == 3) {
-        char line[65536]; static int ids[MAXCTX]; fprintf(stderr, "ready\n");
+        static char line[MAXCTX * 8]; static int ids[MAXCTX]; fprintf(stderr, "ready\n");
         while (fgets(line, sizeof line, stdin)) {
             char *p = line; int ngen = (int)strtol(p, &p, 10), np = 0;
             while (np < MAXCTX - 1) { char *e; long vv = strtol(p, &e, 10); if (e == p) break; ids[np++] = (int)vv; p = e; }
