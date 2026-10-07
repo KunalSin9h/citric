@@ -6,6 +6,7 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <unistd.h>
 
 typedef struct {
     _Alignas(64) atomic_int count;
@@ -19,7 +20,11 @@ static int sbar_arrive(sbar_t *b) {
     if (atomic_fetch_add(&b->count, 1) == b->n - 1) { atomic_store(&b->count, 0); atomic_store(&b->gen, g + 1); }
     return g;
 }
-static void sbar_wait(sbar_t *b, int g) { while (atomic_load(&b->gen) == g) _mm_pause(); }
+// spin first (a step's barriers are microseconds apart); after ~2 ms of waiting nap 50 us at a time, after ~50 ms
+// 500 us, so an idle server costs ~nothing and the first step after a quiet period starts <= 0.5 ms late
+static void sbar_wait(sbar_t *b, int g) {
+    for (unsigned i = 0; atomic_load(&b->gen) == g; i++) { if (i < (1u << 16)) _mm_pause(); else usleep(i < (1u << 16) + 1000 ? 50 : 500); }
+}
 static void sbar_sync(sbar_t *b) { sbar_wait(b, sbar_arrive(b)); }
 
 // first logical cpu of each physical core; returns count

@@ -142,6 +142,12 @@ typedef struct { uint64_t sgn[HW], msk[NBK][HW]; float w[NBK]; int n[NBK]; int t
 static skq_t skq[MAXB];
 static float *skscore;   // [MAXB][VOCAB]
 static float skthr[MAXB];
+// Output head lanes. Only lanes whose logits are needed (need[b]; a prefill chunk needs just its last token) run the
+// 262k-row head, compacted to head slots 0..HB-1: slot j reads lane hl[j]'s hidden state, writes lane hl[j]'s logits.
+static int need[MAXB], HB, hl[MAXB];
+// Optional per-lane top-TK candidates (sorted, best first), merged from each thread's vocab shard while it is hot in cache.
+#define TK 64
+static int topk_on; static float *tkv; static int *tki;   // per thread: [T][MAXB][TK]; merged result in thread 0's rows
 static long ck_steps, ck_hit, ck_same8; static double ck_mass;
 
 static void sketch_build(void) {
@@ -188,7 +194,7 @@ static void sketch_query(skq_t *q, const float *h) {
 static void sketch_scores(int g0, int g1) {
     for (int g = g0; g < g1; g++) {
         const uint64_t *base = sk + (size_t)g * HW * 8;
-        for (int b = 0; b < B; b++) {
+        for (int b = 0; b < HB; b++) {
             const skq_t *q = &skq[b]; __m512i dis[NBK];
             for (int k = 0; k < NBK; k++) dis[k] = _mm512_setzero_si512();
             for (int w = 0; w < HW; w++) {
@@ -206,7 +212,7 @@ static void sketch_scores(int g0, int g1) {
 static void sketch_exact(int g0, int g1) {
     // exact part, 64 rows at a time, column-major: one full 64-byte cache line per top dim
     for (int r = g0 * 8; r < g1 * 8; r += 64)
-        for (int b = 0; b < B; b++) {
+        for (int b = 0; b < HB; b++) {
             const skq_t *q = &skq[b]; __m512 e0 = _mm512_setzero_ps(), e1 = e0, e2 = e0, e3 = e0;
             for (int j = 0; j < TOPD; j++) {
                 const int8_t *col = embT + (size_t)q->top[j] * VOCAB + r; __m512 hv = _mm512_set1_ps(q->htop[j]);
@@ -290,27 +296,52 @@ static void forward_mt(int id) {
         P(6, sbar_sync(&bar));
         if (!id && chk && (l < 2 || l == NLAYER - 1)) { double nn = 0; for (int i = 0; i < HID; i++) nn += x[0][i] * x[0][i]; fprintf(stderr, "  h[%d] pos %d: %.4f %.4f %.4f %.4f |x|=%.3f\n", l + 1, cur_pos[0], x[0][0], x[0][1], x[0][2], x[0][3], sqrt(nn)); }
     }
-    // sketch head pays off for <= 4 lanes (decode); bigger steps (batches, prefill) amortize the exact head's weight reads
-    const int use_sk = sketch_on && (B <= 4 || sketch_check);
-    for (int b = id; b < B; b += T) { P(3, rmsnorm(x[b], ln_final, h, HID)); P(1, prep(&act[b], h, HID)); if (use_sk) sketch_query(&skq[b], h); }
+    // sketch head pays off for <= 4 head lanes (decode); bigger heads (batches) amortize the exact head's weight reads
+    if (!id) { HB = 0; for (int b = 0; b < B; b++) if (need[b]) hl[HB++] = b; }
+    P(6, sbar_sync(&bar));
+    const int use_sk = sketch_on && (HB <= 4 || sketch_check);
+    for (int j = id; j < HB; j += T) { P(3, rmsnorm(x[hl[j]], ln_final, h, HID)); P(1, prep(&act[j], h, HID)); if (use_sk) sketch_query(&skq[j], h); }
     P(6, sbar_sync(&bar));
     const int8_t *xq[MAXB] = {0}; const float *xbs[MAXB] = {0}; float dq[MAXB] = {0}; float *o[MAXB] = {0};
-    for (int b = 0; b < B; b++) { xq[b] = act[b].q; xbs[b] = act[b].xbs; dq[b] = act[b].dq; o[b] = logits + (size_t)b * VOCAB; }
+    for (int j = 0; j < HB; j++) { xq[j] = act[j].q; xbs[j] = act[j].xbs; dq[j] = act[j].dq; o[j] = logits + (size_t)hl[j] * VOCAB; }
     if (use_sk) {
         P(8, for (int u0; (u0 = __atomic_fetch_add(hd_ctr, 16, __ATOMIC_RELAXED)) < VOCAB / 64;) {   // 16 units of 64 rows
             sketch_scores(u0 * 8, (u0 + 16) * 8); sketch_exact(u0 * 8, (u0 + 16) * 8); });
         P(6, sbar_sync(&bar));
-        if (!id) for (int b = 0; b < B; b++) skthr[b] = sketch_threshold(skscore + (size_t)b * VOCAB);
+        if (!id) for (int j = 0; j < HB; j++) skthr[j] = sketch_threshold(skscore + (size_t)j * VOCAB);
         P(6, sbar_sync(&bar));
     }
     shard(VOCAB / 16, id, &b0, &b1);
     if (use_sk && !sketch_check) {
-        P(10, for (int b = 0; b < B; b++) { const float *sc = skscore + (size_t)b * VOCAB; float *lg = o[b];
-            for (int v = b0 * 16; v < b1 * 16; v++) lg[v] = sc[v] >= skthr[b] ? exact_row(&skq[b], v) : -1e30f; });
-    } else P(5, mv4(&emb4, xq, xbs, dq, o, B, b0, b1));
-    for (int b = 0; b < B; b++) { const float *lg = logits + (size_t)b * VOCAB; int best = b0 * 16; for (int vv = b0 * 16 + 1; vv < b1 * 16; vv++) if (lg[vv] > lg[best]) best = vv; best_t[b][id] = best; }
+        P(10, for (int j = 0; j < HB; j++) { const float *sc = skscore + (size_t)j * VOCAB; float *lg = o[j];
+            for (int v = b0 * 16; v < b1 * 16; v++) lg[v] = sc[v] >= skthr[j] ? exact_row(&skq[j], v) : -1e30f; });
+    } else P(5, mv4(&emb4, xq, xbs, dq, o, HB, b0, b1));
+    for (int j = 0; j < HB; j++) {
+        const float *lg = o[j];
+        if (topk_on) {   // this shard's top TK (sorted insert; almost every value fails the first compare)
+            float *tv = tkv + ((size_t)id * MAXB + j) * TK; int *ti = tki + ((size_t)id * MAXB + j) * TK, n = 0;
+            for (int vv = b0 * 16; vv < b1 * 16; vv++) {
+                float x = lg[vv]; if (n == TK && x <= tv[TK - 1]) continue;
+                int i = n < TK ? n++ : TK - 1;
+                while (i > 0 && tv[i - 1] < x) { tv[i] = tv[i - 1]; ti[i] = ti[i - 1]; i--; }
+                tv[i] = x; ti[i] = vv;
+            }
+            for (; n < TK; n++) { tv[n] = -1e30f; ti[n] = b0 * 16; }
+            best_t[j][id] = ti[0];
+        } else { int best = b0 * 16; for (int vv = b0 * 16 + 1; vv < b1 * 16; vv++) if (lg[vv] > lg[best]) best = vv; best_t[j][id] = best; }
+    }
     P(6, sbar_sync(&bar));
-    if (!id) for (int b = 0; b < B; b++) { const float *lg = logits + (size_t)b * VOCAB; for (int i = 1; i < T; i++) if (lg[best_t[b][i]] > lg[best_t[b][0]]) best_t[b][0] = best_t[b][i]; }
+    if (topk_on) for (int j = id; j < HB; j += T) {   // merge the T sorted shard lists into thread 0's row
+        float mv[TK]; int mi[TK], at[256] = {0};
+        for (int k = 0; k < TK; k++) {
+            int bi = 0; for (int t = 1; t < T; t++) if (tkv[((size_t)t * MAXB + j) * TK + at[t]] > tkv[((size_t)bi * MAXB + j) * TK + at[bi]]) bi = t;
+            mv[k] = tkv[((size_t)bi * MAXB + j) * TK + at[bi]]; mi[k] = tki[((size_t)bi * MAXB + j) * TK + at[bi]]; at[bi]++;
+        }
+        memcpy(tkv + (size_t)j * TK, mv, sizeof mv); memcpy(tki + (size_t)j * TK, mi, sizeof mi);
+    }
+    if (!id) for (int j = 0; j < HB; j++) { const float *lg = o[j]; for (int i = 1; i < T; i++) if (lg[best_t[j][i]] > lg[best_t[j][0]]) best_t[j][0] = best_t[j][i]; }
+    if (!id) for (int j = HB - 1; j >= 0; j--) best_t[hl[j]][0] = best_t[j][0];   // back to lane order (hl[j] >= j)
+    if (topk_on) P(6, sbar_sync(&bar));
     if (!id && sketch_check) for (int b = 0; b < B; b++) {   // exact logits are in place: is the true argmax a candidate, and how much softmax mass do candidates hold?
         const float *lg = logits + (size_t)b * VOCAB, *sc = skscore + (size_t)b * VOCAB; float mx = lg[best_t[b][0]]; double z = 0, zin = 0; long ncand = 0;
         for (int v = 0; v < VOCAB; v++) { double e = exp(lg[v] - mx); z += e; if (sc[v] >= skthr[b]) { zin += e; ncand++; } }
@@ -326,7 +357,12 @@ static void forward_mt(int id) {
 }
 
 // ---------- driver: threads, sampling, speculation, prefill ----------
+static void step_need(const int *tok, const int *pos, int *next);
 static void step(const int *tok, const int *pos, int *next) {
+    for (int b = 0; b < B; b++) { cur_tok[b] = tok[b]; cur_pos[b] = pos[b]; need[b] = 1; }
+    step_need(tok, pos, next);
+}
+static void step_need(const int *tok, const int *pos, int *next) {
     for (int b = 0; b < B; b++) { cur_tok[b] = tok[b]; cur_pos[b] = pos[b]; }
     static double t_out; double t_ = now_ns(); if (t_out) prof[7] += t_ - t_out;
     sbar_sync(&bar); forward_mt(0); sbar_sync(&bar);
@@ -340,11 +376,11 @@ static void generate(const int *prompt, int np, int ngen) {
     static int hist[MAXCTX]; int n = 0;
     for (int i = 0; i < np; i++) hist[n++] = prompt[i];
     const int nstreams = B;
-    t0 = now_ns(); double nll = 0;
+    t0 = now_ns(); double nll = 0; const int ppl = getenv("PPL") != NULL;
     for (int i0 = 0; i0 < np; i0 += MAXB / nstreams) {   // batched prefill
         int cnt = np - i0 < MAXB / nstreams ? np - i0 : MAXB / nstreams; B = cnt * nstreams;
-        for (int b = 0; b < B; b++) { kv_map[b] = b / cnt; tok[b] = hist[i0 + b % cnt]; posv[b] = i0 + b % cnt; }
-        step(tok, posv, next);
+        for (int b = 0; b < B; b++) { kv_map[b] = b / cnt; tok[b] = hist[i0 + b % cnt]; posv[b] = i0 + b % cnt; need[b] = ppl || b % cnt == cnt - 1; }
+        step_need(tok, posv, next);   // prefill: only each stream's last lane needs the output head (all of them for PPL)
         if (getenv("PPL")) for (int j = 0; j < cnt && i0 + j + 1 < np; j++) {
             const float *lg = logits + (size_t)j * VOCAB; float mx = -1e30f; for (int vv = 0; vv < VOCAB; vv++) if (lg[vv] > mx) mx = lg[vv];
             double z = 0; for (int vv = 0; vv < VOCAB; vv++) z += exp(lg[vv] - mx);
@@ -393,19 +429,15 @@ static void generate(const int *prompt, int np, int ngen) {
             np, tp / 1e6, np / (tp / 1e9), gen, nstreams, tg / 1e6, gen / (tg / 1e9), (double)gen * nstreams / (tg / 1e9));
 }
 
-int main(int argc, char **argv) {
-    if (argc < 4 && !(argc == 3 && !strcmp(argv[2], "-"))) { fprintf(stderr, "usage: %s model_dir n_gen tok...  |  %s model_dir -\n", argv[0], argv[0]); return 1; }
+// load the model, allocate nseq KV streams, start the worker threads (the caller becomes thread 0)
+static pthread_t th[256];
+static void init(const char *dir, int nseq) {
     int nc = find_cores(cpus, 256);
     T = getenv("THREADS") ? atoi(getenv("THREADS")) : nc; if (T > nc) for (int i = 0; i < T && i < 256; i++) cpus[i] = i;
-    B = getenv("BATCH") ? atoi(getenv("BATCH")) : 1; if (B > MAXB) B = MAXB;
-    if (getenv("TEMP")) temp = atof(getenv("TEMP"));
-    if (getenv("REP")) rep = atof(getenv("REP"));
-    if (getenv("TOPK")) topk = atoi(getenv("TOPK"));
-    if (getenv("SEED")) srng = strtoull(getenv("SEED"), NULL, 10) * 2654435761ull + 1;
-    nkv = B; kv_alloc(); logits = xalloc((size_t)MAXB * VOCAB * 4);
+    nkv = nseq; kv_alloc(); logits = xalloc((size_t)MAXB * VOCAB * 4);
     double t0 = now_ns();
     stats = getenv("STATS") != NULL;
-    load(argv[1]); make_tables(); make_perm(perm_h, HID); make_perm(perm_q, QDIM); make_perm(perm_f, FFN);
+    load(dir); make_tables(); make_perm(perm_h, HID); make_perm(perm_q, QDIM); make_perm(perm_f, FFN);
     char nm[160];
 #define TN(t) (snprintf(nm, sizeof nm, "model.layers.%d." t ".weight", l), tensor(nm))
 #define VN(t, n) (snprintf(nm, sizeof nm, "model.layers.%d." t ".weight", l), vecf(nm, n))
@@ -431,10 +463,44 @@ int main(int argc, char **argv) {
     if (sketch_on) sketch_build();
     for (int gl = 0; gl < 2; gl++) { float base = gl ? 1000000.0f : 10000.0f;
         for (int p = 0; p < MAXCTX; p++) for (int i = 0; i < HD / 2; i++) { float ang = p * powf(base, -2.0f * i / HD); rope_c[gl][p][i] = cosf(ang); rope_s[gl][p][i] = sinf(ang); } }
-    fprintf(stderr, "loaded gemma-3-1b-it-ternary in %.1f s, %d threads, batch %d\n", (now_ns() - t0) / 1e9, T, B);
-
-    sbar_init(&bar, T); pthread_t th[256]; pin(cpus[0]);
+    fprintf(stderr, "loaded gemma-3-1b-it-ternary in %.1f s, %d threads, %d kv streams\n", (now_ns() - t0) / 1e9, T, nkv);
+    sbar_init(&bar, T); pin(cpus[0]);
     for (long i = 1; i < T; i++) pthread_create(&th[i], NULL, worker, (void *)i);
+}
+
+#ifdef CITRIC_LIB
+// ---------- library API (the HTTP server links this file with -DCITRIC_LIB). Call everything from one thread. ----------
+int citric_init(const char *dir, int max_seqs) {
+    init(dir, max_seqs); topk_on = 1; tkv = xalloc((size_t)T * MAXB * TK * 4); tki = xalloc((size_t)T * MAXB * TK * 4);
+    return VOCAB;
+}
+int citric_max_lanes(void) { return MAXB; }
+int citric_max_ctx(void) { return MAXCTX; }
+// One forward step over n <= MAXB lanes. Lane i feeds token tok[i] at position pos[i] of sequence seq[i] (a KV
+// stream < max_seqs); lanes of one sequence may cover consecutive positions (chunked prefill). Afterwards lane i's
+// next-token logits are at citric_logits() + i * VOCAB and its argmax in next[i]. With <= 4 lanes the sketch head
+// runs: logits outside its ~1k candidates are -1e30.
+// want[i] = 0: lane i's logits are not needed (a prefill token before the prompt's last): its head is skipped,
+// next[i] and its logits row are undefined. After the call, citric_topk(i, &v, &id) gives lane i's TK best
+// (logit, token) pairs, best first, for every lane with want[i] = 1.
+void citric_step(int n, const int *tok, const int *pos, const int *seq, const int *want, int *next) {
+    B = n; for (int b = 0; b < n; b++) { kv_map[b] = seq[b]; need[b] = want[b]; }
+    step_need(tok, pos, next);
+}
+const float *citric_logits(void) { return logits; }
+int citric_topk(int lane, const float **v, const int **ids) {   // lane -> its head slot
+    int j = 0; while (j < HB && hl[j] != lane) j++;
+    *v = tkv + (size_t)j * TK; *ids = tki + (size_t)j * TK; return TK;
+}
+#else
+int main(int argc, char **argv) {
+    if (argc < 4 && !(argc == 3 && !strcmp(argv[2], "-"))) { fprintf(stderr, "usage: %s model_dir n_gen tok...  |  %s model_dir -\n", argv[0], argv[0]); return 1; }
+    B = getenv("BATCH") ? atoi(getenv("BATCH")) : 1; if (B > MAXB) B = MAXB;
+    if (getenv("TEMP")) temp = atof(getenv("TEMP"));
+    if (getenv("REP")) rep = atof(getenv("REP"));
+    if (getenv("TOPK")) topk = atoi(getenv("TOPK"));
+    if (getenv("SEED")) srng = strtoull(getenv("SEED"), NULL, 10) * 2654435761ull + 1;
+    init(argv[1], B);
     if (argc == 3) {
         char line[65536]; static int ids[MAXCTX]; fprintf(stderr, "ready\n");
         while (fgets(line, sizeof line, stdin)) {
@@ -454,3 +520,4 @@ int main(int argc, char **argv) {
     quit = 1; sbar_sync(&bar); for (int i = 1; i < T; i++) pthread_join(th[i], NULL);
     return 0;
 }
+#endif
