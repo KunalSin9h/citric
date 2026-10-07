@@ -1,6 +1,10 @@
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/566ddcc3-bcb5-472d-8c6c-909e48c4a6f2" alt="Citric" width="160">
+</p>
+
 # Citric
 
-Fast LLM inference on a normal CPU. No GPU. No Python in the hot path. Plain C and AVX-512.
+Fast LLM inference on a normal CPU. No GPU. Plain C and AVX-512.
 
 On a 6-core laptop, Citric runs our ternary Gemma 3 1B at **116 tokens per second**.
 The original Gemma 3 1B runs at 44 tokens per second in the same engine.
