@@ -4,7 +4,7 @@
 
 # Citric
 
-Fast LLM inference on a normal CPU. No GPU. Plain C and AVX-512.
+Fast LLM inference on a normal CPU. Plain C and AVX-512.
 
 On a 6-core laptop, Citric runs our ternary Gemma 3 1B at **116 tokens per second**.
 The original Gemma 3 1B runs at 44 tokens per second in the same engine.
