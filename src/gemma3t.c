@@ -488,6 +488,16 @@ void citric_step(int n, const int *tok, const int *pos, const int *seq, const in
     step_need(tok, pos, next);
 }
 const float *citric_logits(void) { return logits; }
+// Copy the KV cache of positions 0..n-1 from sequence slot src to dst (prefix reuse: a shared system prompt or an
+// earlier turn of the same chat). Whole 16-position blocks are copied; dst positions >= n are rewritten before use.
+void citric_kv_copy(int src, int dst, int n) {
+    size_t n16 = (size_t)(n + 15) / 16 * 16;
+    for (int l = 0; l < NLAYER; l++) {
+        kvh_t *a = &kvh[(size_t)src * NLAYER + l], *b = &kvh[(size_t)dst * NLAYER + l];
+        memcpy(b->k8, a->k8, n16 * HD); memcpy(b->v8, a->v8, n16 * HD);
+        memcpy(b->ksc, a->ksc, n16 * 4); memcpy(b->vsc, a->vsc, n16 * 4); memcpy(b->ksum, a->ksum, n16 * 4);
+    }
+}
 int citric_topk(int lane, const float **v, const int **ids) {   // lane -> its head slot
     int j = 0; while (j < HB && hl[j] != lane) j++;
     *v = tkv + (size_t)j * TK; *ids = tki + (size_t)j * TK; return TK;
